@@ -1,3 +1,4 @@
+import { terminalRecordSchema } from '@archon/workflows/schemas/terminal-record';
 /**
  * Zod schemas for workflow API endpoints.
  */
@@ -6,6 +7,7 @@ import { workflowDefinitionSchema as engineWorkflowDefinitionSchema } from '@arc
 import {
   workflowRunSchema as engineWorkflowRunSchema,
   workflowRunOutcomeSchema as engineWorkflowRunOutcomeSchema,
+  workflowWaitContextSchema as engineWorkflowWaitContextSchema,
 } from '@archon/workflows/schemas/workflow-run';
 import { workflowEventRowSchema } from '@archon/core/schemas/workflow-event';
 import { dashboardWorkflowRunSchema as coreDashboardWorkflowRunSchema } from '@archon/core/schemas/workflow-run';
@@ -117,10 +119,21 @@ export const workflowRunOutcomeSchema = engineWorkflowRunOutcomeSchema
   .nullable()
   .openapi('WorkflowRunOutcome');
 
+/** Persisted durable-wait cursor exposed to API clients without erasing its discriminants. */
+export const workflowWaitContextSchema =
+  engineWorkflowWaitContextSchema.openapi('WorkflowWaitContext');
+
+/** Run metadata stays open-ended, but its durable-wait contract is engine-owned and typed. */
+export const workflowRunMetadataSchema = z
+  .object({ wait: workflowWaitContextSchema.optional() })
+  .catchall(z.unknown())
+  .openapi('WorkflowRunMetadata');
+
 /** A workflow run record (wire shape with ISO string dates). */
 export const workflowRunSchema = engineWorkflowRunSchema
   .extend({
     outcome: workflowRunOutcomeSchema,
+    metadata: workflowRunMetadataSchema,
     started_at: z.string(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
@@ -146,6 +159,7 @@ export const workflowRunDetailSchema = z
       worker_platform_id: z.string().optional(),
       parent_platform_id: z.string().optional(),
       conversation_platform_id: z.string().nullable(),
+      terminal_record: terminalRecordSchema.nullable(),
     }),
     events: z.array(workflowEventSchema),
   })
@@ -216,6 +230,7 @@ export const resetWorkflowNodeSessionsResponseSchema = z
 /** Dashboard enriched workflow run (wire shape with ISO string dates). */
 export const dashboardWorkflowRunSchema = coreDashboardWorkflowRunSchema
   .extend({
+    metadata: workflowRunMetadataSchema,
     started_at: z.string(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),

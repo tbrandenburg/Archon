@@ -41,8 +41,11 @@ export {
   getProjectStoragePaths,
   getStoragePathsForRoot,
   isInsideArchonHome,
+  resolveRunStorageRoot,
   getRunArtifactsDirForKey,
   getRunArtifactsDirForRoot,
+  getRunLogPathForRoot,
+  getRunWorkflowSourceDirForRoot,
   slugifyFolderName,
   getFolderProjectRoot,
   getFolderProjectArtifactsPath,
@@ -53,7 +56,9 @@ export {
   ensureProjectStructure,
   createProjectSourceSymlink,
   findMarkdownFilesRecursive,
+  findCommandFiles,
   getWebDistDir,
+  getSourceWebDistDir,
 } from './archon-paths';
 export type { ProjectStorageKey, ProjectStoragePaths } from './archon-paths';
 

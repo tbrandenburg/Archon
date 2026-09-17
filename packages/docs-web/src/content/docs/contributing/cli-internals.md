@@ -92,12 +92,12 @@ packages/cli/
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ archon workflow list [--json]                                    │
+│ archon workflow list [name] [--full] [--json]                    │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ workflow.ts  workflowListCommand(cwd, json?)                     │
+│ workflow.ts  workflowListCommand(cwd, { name, full, json })      │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -109,12 +109,20 @@ packages/cli/
 │ - Merges (repo overrides defaults by name)                       │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Optional name resolution; project errors remain in the result    │
+│ full=false: bounded description + structured truncation state    │
+│ full=true: exact authored description                            │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
                ┌───────────────┴───────────────┐
                │ json=true                     │ json=false
                ▼                               ▼
 ┌──────────────────────────┐   ┌───────────────────────────────────┐
 │ JSON output to stdout    │   │ Human-readable list to stdout     │
-│ { workflows, errors }    │   │ name, description, type, options  │
+│ descriptionTruncated     │   │ shortened descriptions carry     │
+│ { workflows, errors }    │   │ the ` [truncated]` marker         │
 └──────────────────────────┘   └───────────────────────────────────┘
 ```
 
@@ -207,15 +215,19 @@ packages/cli/
 ┌──────────────────────────────────────────────────────────────────┐
 │ workflow.ts  workflowEventEmitCommand(..., cwd)                   │
 │              Resolve an unambiguous run-id prefix                 │
-│              createWorkflowStore().createWorkflowEvent(...)       │
-│              Persistence is non-throwing (fire-and-forget)        │
+│              Node state: persistWorkflowEvent(...)               │
+│              Observability: createWorkflowEvent(...)             │
 │              Run-ID resolution may fail                           │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 **Code:** `packages/cli/src/cli.ts` (case 'event'), `packages/cli/src/commands/workflow.ts:workflowEventEmitCommand`
 
-**Contract:** Event persistence is best-effort. `createWorkflowEvent` catches all errors internally -- the CLI prints a confirmation but cannot guarantee the event was stored.
+**Contract:** The shared `isNodeStateEventType` predicate routes node-state events through
+`persistWorkflowEvent`, which propagates storage failures. The CLI prints `Event persisted`
+only after that write succeeds. Other events use `createWorkflowEvent` and retain best-effort
+persistence: `Event submitted (best-effort)` does not guarantee storage. Run-ID resolution
+can fail before either write.
 
 ---
 

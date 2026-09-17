@@ -30,7 +30,7 @@ import {
   logWorkflowError,
   logWorkflowComplete,
   logNodeComplete,
-  logNodeError,
+  logWatchdogReset,
   type WorkflowEvent,
 } from './logger';
 
@@ -117,6 +117,26 @@ describe('Workflow Logger', () => {
     });
   });
 
+  describe('logWatchdogReset', () => {
+    it('persists the reset timestamp and chunk type without chunk content', async () => {
+      const resetAt = Date.parse('2026-08-31T20:31:53.123Z');
+
+      await logWatchdogReset(testDir, 'watchdog-test', 'review', 'thinking', resetAt);
+
+      const events = await readLogFile('watchdog-test');
+      expect(events).toEqual([
+        expect.objectContaining({
+          type: 'watchdog_reset',
+          workflow_id: 'watchdog-test',
+          step: 'review',
+          chunk_type: 'thinking',
+          ts: '2026-08-31T20:31:53.123Z',
+        }),
+      ]);
+      expect(events[0].content).toBeUndefined();
+    });
+  });
+
   describe('logWorkflowStart', () => {
     it('should log workflow start with name and user message', async () => {
       await logWorkflowStart(testDir, 'start-test', 'my-workflow', 'User wants to build feature X');
@@ -169,46 +189,6 @@ describe('Workflow Logger', () => {
       const [absent] = await readLogFile('no-cost');
       expect(zero.cost_usd).toBe(0);
       expect('cost_usd' in absent).toBe(false);
-    });
-  });
-
-  describe('logNodeError', () => {
-    it('records what the node spent before it failed', async () => {
-      await logNodeError(testDir, 'fail-cost', 'step1', 'provider stream died', {
-        tokens: { input: 120, output: 10, cacheRead: 80, cacheWrite: 0 },
-        cost_usd: 0.02,
-      });
-
-      const [event] = await readLogFile('fail-cost');
-      expect(event.type).toBe('node_error');
-      expect(event.error).toBe('provider stream died');
-      expect(event.cost_usd).toBe(0.02);
-      expect(event.tokens).toEqual({ input: 120, output: 10, cacheRead: 80, cacheWrite: 0 });
-    });
-
-    it('keeps a reported zero cost distinct from an unreported one', async () => {
-      // Same distinction the completion row protects: Codex reports no cost at all
-      // (#2334), so an absent key must not be readable as "spent nothing".
-      await logNodeError(testDir, 'fail-zero', 'step1', 'boom', { cost_usd: 0 });
-      await logNodeError(testDir, 'fail-unreported', 'step1', 'boom', {
-        tokens: { input: 5, output: 1 },
-      });
-
-      const [zero] = await readLogFile('fail-zero');
-      const [absent] = await readLogFile('fail-unreported');
-      expect(zero.cost_usd).toBe(0);
-      expect('cost_usd' in absent).toBe(false);
-    });
-
-    it('writes no usage keys for a failure that could not have spent anything', async () => {
-      // A missing command file, a substitution error, a bash exit code: these fail
-      // before any provider call, and their callers pass nothing.
-      await logNodeError(testDir, 'fail-bare', 'step1', 'command file not found');
-
-      const [event] = await readLogFile('fail-bare');
-      expect(event.error).toBe('command file not found');
-      expect('cost_usd' in event).toBe(false);
-      expect('tokens' in event).toBe(false);
     });
   });
 
@@ -265,6 +245,25 @@ Line 3`;
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe('workflow_error');
       expect(events[0].error).toBe('Step prompt not found: missing-step.md');
+    });
+
+    it('records aggregate run usage when supplied', async () => {
+      await logWorkflowError(testDir, 'error-usage', 'Node failed', {
+        cost_usd: 0.08,
+        tokens: { input: 1200, output: 80, cacheRead: 900, cacheWrite: 0 },
+      });
+
+      const [event] = await readLogFile('error-usage');
+      expect(event.cost_usd).toBe(0.08);
+      expect(event.tokens).toEqual({ input: 1200, output: 80, cacheRead: 900, cacheWrite: 0 });
+    });
+
+    it('omits aggregate usage axes when they were not reported', async () => {
+      await logWorkflowError(testDir, 'error-no-usage', 'Node failed');
+
+      const [event] = await readLogFile('error-no-usage');
+      expect('cost_usd' in event).toBe(false);
+      expect('tokens' in event).toBe(false);
     });
   });
 

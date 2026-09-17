@@ -10,7 +10,7 @@
  * - Conversation-scoped subscriptions via registerRun() mapping
  */
 import { EventEmitter } from 'events';
-import type { ArtifactType } from './schemas';
+import type { ArtifactType, EffortLevel, NodeSkipReason, SkipCause } from './schemas';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -29,6 +29,7 @@ interface WorkflowStartedEvent {
   runId: string;
   workflowName: string;
   conversationId: string;
+  transcriptPath: string;
 }
 
 interface WorkflowCompletedEvent {
@@ -87,7 +88,7 @@ interface NodeStartedEvent {
   provider?: string; // resolved AI provider (absent for bash/script nodes)
   model?: string; // resolved model string (absent for bash/script nodes)
   tier?: 'small' | 'medium' | 'large'; // only set when node.model was a tier keyword
-  effort?: string; // resolved AI effort (absent when unset or unsupported)
+  effort?: EffortLevel; // resolved AI effort (absent when unset or unsupported)
 }
 
 interface NodeCompletedEvent {
@@ -109,13 +110,21 @@ interface NodeFailedEvent {
   error: string;
 }
 
-interface NodeSkippedEvent {
+interface NodeSkippedEventBase {
   type: 'node_skipped';
   runId: string;
   nodeId: string;
   nodeName: string;
-  reason: 'when_condition' | 'when_condition_parse_error' | 'trigger_rule' | 'prior_success';
 }
+
+type NodeSkippedEvent = NodeSkippedEventBase &
+  (
+    | { reason: 'prior_success' }
+    | {
+        reason: Exclude<NodeSkipReason, 'prior_success'>;
+        cause: SkipCause;
+      }
+  );
 
 interface ToolStartedEvent {
   type: 'tool_started';
@@ -281,9 +290,12 @@ class WorkflowEventEmitter {
   }
 
   /**
-   * Subscribe to all workflow events. Returns an unsubscribe function.
+   * Subscribe to all workflow events, across every run. Returns an unsubscribe function.
+   *
+   * Named distinctly from the future per-run `IWorkflowEngine.subscribe(runId, listener)`
+   * (M6) so the two APIs never collide.
    */
-  subscribe(listener: Listener): () => void {
+  subscribeAll(listener: Listener): () => void {
     // Wrap listener to catch errors - listener failures must not propagate
     const safeListener = (event: WorkflowEmitterEvent): void => {
       try {
@@ -303,7 +315,7 @@ class WorkflowEventEmitter {
    * Subscribe to events for a specific conversation only. Returns unsubscribe function.
    */
   subscribeForConversation(conversationId: string, listener: Listener): () => void {
-    return this.subscribe((event: WorkflowEmitterEvent) => {
+    return this.subscribeAll((event: WorkflowEmitterEvent) => {
       const eventConversationId = this.conversationMap.get(event.runId);
       if (eventConversationId === conversationId) {
         listener(event);

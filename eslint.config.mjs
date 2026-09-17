@@ -1,6 +1,17 @@
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import prettierConfig from 'eslint-config-prettier';
+import { readFileSync } from 'node:fs';
+
+// Both file lists below are DERIVED from the tsconfig project that owns them, so
+// type-check, lint and execution can never select different files.
+const includeGlobs = (tsconfigPath, prefix) =>
+  JSON.parse(readFileSync(new URL(tsconfigPath, import.meta.url), 'utf8')).include.map(
+    pattern => `${prefix}${pattern}`
+  );
+
+const archonScriptFiles = includeGlobs('./.archon/scripts/tsconfig.json', '.archon/scripts/');
+const packScriptFiles = includeGlobs('./.archon/workflows/tsconfig.json', '.archon/workflows/');
 
 export default tseslint.config(
   // Global ignores (applied to all configs)
@@ -20,11 +31,18 @@ export default tseslint.config(
       '.worktrees/**',
       '.claude/worktrees/**',
       '.claude/skills/**',
-      '.archon/**', // User workflow/script/command content — not in any tsconfig project
+      '.archon/commands/**',
+      '.archon/maintainer-standup/**',
+      // Workflow packs hold prompts, YAML and fixtures, none of them lintable. Their
+      // deterministic scripts are TypeScript and ARE linted, through the globs the
+      // pack tsconfig owns, so the ignore names what stays out rather than the tree.
+      '.archon/workflows/**/commands/**',
+      '.archon/workflows/**/fixtures/**',
       '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
       '*.mjs',
-      '**/*.test.ts',
+      'packages/**/*.test.ts',
+      'scripts/**/*.test.ts',
       '**/src/test/**', // Test helper files (mock factories, fixtures)
       '*.d.ts', // Root-level declaration files (not in tsconfig project scope)
       '**/*.generated.d.ts', // Auto-generated declaration files (e.g. openapi-typescript output)
@@ -46,7 +64,12 @@ export default tseslint.config(
 
   // Project-specific settings
   {
-    files: ['packages/*/src/**/*.{ts,tsx}', 'scripts/**/*.ts'],
+    files: [
+      'packages/*/src/**/*.{ts,tsx}',
+      'scripts/**/*.ts',
+      ...archonScriptFiles,
+      ...packScriptFiles,
+    ],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -111,6 +134,30 @@ export default tseslint.config(
       '@typescript-eslint/require-await': 'off',
       // Constructor style preference
       '@typescript-eslint/consistent-generic-constructors': 'off',
+    },
+  },
+
+  {
+    files: archonScriptFiles,
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+        project: './.archon/scripts/tsconfig.json',
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+
+  // Pack scripts sit outside every package, so typed rules need their owning project
+  // named explicitly rather than discovered.
+  {
+    files: packScriptFiles,
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+        project: './.archon/workflows/tsconfig.json',
+        tsconfigRootDir: import.meta.dirname,
+      },
     },
   },
 

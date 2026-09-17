@@ -1,6 +1,10 @@
-import type { NativeTool } from '@archon/providers/types';
+import { defineNativeToolInputSchema, type NativeTool } from '@archon/providers/types';
 import { createLogger } from '@archon/paths';
-import { isApprovalContext, isContainerRun } from '@archon/workflows/schemas/workflow-run';
+import {
+  isApprovalContext,
+  isContainerRun,
+  runAttention,
+} from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { listDashboardRuns, findWorkflowRunsByIdPrefix } from '../db/workflows';
 import {
@@ -75,41 +79,40 @@ const ACTIONS = [
 ] as const;
 type Action = (typeof ACTIONS)[number];
 
-const INPUT_SCHEMA: Record<string, unknown> = {
-  type: 'object',
+const INPUT_SCHEMA = defineNativeToolInputSchema({
   properties: {
     action: {
-      type: 'string',
-      enum: [...ACTIONS],
+      kind: 'enum',
+      values: [...ACTIONS],
       description:
         "What to do. Call action='help' (optionally with subtool=<action>) to see exactly what each action needs before using it.",
     },
     subtool: {
-      type: 'string',
+      kind: 'string',
       description:
         "For action=help: the action to describe (e.g. 'approve'). Omit for an overview.",
     },
     runId: {
-      type: 'string',
+      kind: 'string',
       description:
         'Run id — required for get/resume/cancel/abandon/approve/reject/respond. Accepts the short (8-char) or full id.',
     },
     workflow: {
-      type: 'string',
+      kind: 'string',
       description: 'Workflow name to launch — required for action=start.',
     },
     decision: {
-      type: 'string',
+      kind: 'string',
       description:
         "Required for action=respond: the decision id the paused gate declared (call action=get to see them — the run detail lists 'gate: decisions: ...' when applicable). 'approve'/'reject' work here too, but prefer the dedicated approve/reject actions for those — respond is for a gate whose declared decisions include something else (e.g. 'revise', 'escalate'). An id the gate did not declare fails with the actual options.",
     },
     message: {
-      type: 'string',
+      kind: 'string',
       description:
         'Free text whose meaning depends on the action: start=the prompt/instructions; approve=optional comment; reject=the reason; respond=text recorded alongside the decision.',
     },
     confirm: {
-      type: 'boolean',
+      kind: 'boolean',
       description:
         'Required (true) to actually perform a destructive action (cancel/abandon/approve/reject/respond). Omit first to get a preview.',
     },
@@ -118,13 +121,13 @@ const INPUT_SCHEMA: Record<string, unknown> = {
     // every approve must still be able to force finalize — that footgun is the
     // reason this arg exists (#2074).
     accept: {
-      type: 'boolean',
+      kind: 'boolean',
       description:
         'For action=approve on an interactive-loop gate with completionSignaled=true: accept=true finalizes the node from the already-computed output WITHOUT re-running, regardless of any message (a simultaneous message is discarded, not recorded). Omit and pass message=<feedback> to run another iteration instead.',
     },
   },
   required: ['action'],
-};
+});
 
 // ─── Progressive-disclosure help text ───────────────────────────────────────
 
@@ -132,7 +135,7 @@ const HELP_OVERVIEW = [
   'manage_run — inspect and operate this project’s workflow runs.',
   '',
   'Actions (call action=help subtool=<name> for details):',
-  '  list     — recent runs in this project (id, workflow, status, step). No params.',
+  '  list     — recent runs in this project (id, workflow, status, authored outcome, active nodes). No params.',
   '  get      — one run’s detail. Params: runId.',
   '  start    — launch a workflow in the background. Params: workflow, message.',
   '  resume   — check a failed/paused run can resume from completed nodes. Params: runId.',
@@ -147,8 +150,8 @@ const HELP_OVERVIEW = [
 ].join('\n');
 
 const HELP_BY_ACTION: Record<Exclude<Action, 'help'>, string> = {
-  list: 'list — recent runs for this project, most recent first. No parameters. Returns id · workflow · status · current step.',
-  get: 'get — full detail for one run. Required: runId (short or full). Returns status, start/finish times, and error if any. Scoped to this project.',
+  list: 'list — recent runs for this project, most recent first. No parameters. Returns id · workflow · status · authored outcome when declared · active node(s).',
+  get: 'get — full detail for one run. Required: runId (short or full). Returns status, authored outcome when declared, start/finish times, and error if any. Scoped to this project.',
   start:
     'start — launch a workflow in the background. Required: workflow (name). Recommended: message (what it should do). It appears in the runs list and the workflow dock.',
   resume:
@@ -246,11 +249,10 @@ async function handleList(ctx: ManageRunContext): Promise<string> {
   if (runs.length === 0) return 'No workflow runs for this project yet.';
 
   const lines = runs.map(r => {
-    const step =
-      r.current_step_name !== null
-        ? ` · ${r.current_step_name}${r.total_steps !== null ? `/${r.total_steps.toString()}` : ''}`
-        : '';
-    return `- ${r.id.slice(0, 8)} · ${r.workflow_name} · ${r.status}${step}`;
+    const activeNodes =
+      r.active_nodes.length > 0 ? ` · active node(s): ${r.active_nodes.join(', ')}` : '';
+    const outcome = r.outcome ? ` · authored outcome: ${r.outcome}` : '';
+    return `- ${r.id.slice(0, 8)} · ${r.workflow_name} · ${r.status}${outcome}${activeNodes}`;
   });
   return `${runs.length.toString()} run(s) (most recent first):\n${lines.join('\n')}`;
 }
@@ -268,17 +270,22 @@ function formatTimestamp(val: Date | string): string {
 }
 
 function formatRunDetail(run: WorkflowRun): string {
-  const parts = [
-    `Run ${run.id.slice(0, 8)} · ${run.workflow_name}`,
-    `status: ${run.status}`,
-    `started: ${formatTimestamp(run.started_at)}`,
-  ];
+  const parts = [`Run ${run.id.slice(0, 8)} · ${run.workflow_name}`, `status: ${run.status}`];
+  if (run.outcome !== null) parts.push(`authored outcome: ${run.outcome}`);
+  parts.push(`started: ${formatTimestamp(run.started_at)}`);
   if (run.completed_at !== null) parts.push(`finished: ${formatTimestamp(run.completed_at)}`);
   const error = run.metadata.error;
   if (typeof error === 'string' && error.length > 0) parts.push(`error: ${error.slice(0, 300)}`);
   // Paused interactive-loop gate: surface the structured gate state (#2074) so an
   // AI approver can decide finalize-vs-iterate without parsing prose.
   const rawApproval = run.metadata.approval;
+  const attention = runAttention(run);
+  if (attention?.kind === 'action_required') {
+    parts.push(`action required: ${attention.message.slice(0, 300)}`);
+    parts.push(
+      `-> complete the action, then run \`archon workflow resume ${run.id}\`; abandon it if it should not continue.`
+    );
+  }
   if (
     run.status === 'paused' &&
     isApprovalContext(rawApproval) &&

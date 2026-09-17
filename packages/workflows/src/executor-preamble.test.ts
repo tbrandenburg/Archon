@@ -9,7 +9,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowDefinition, WorkflowRun } from './schemas';
+import type { ResolvedWorkflow, WorkflowDefinition, WorkflowRun } from './schemas';
+import { resolveWorkflow } from './graph-plan';
 
 // ---------------------------------------------------------------------------
 // Mock logger (must precede all module-under-test imports)
@@ -102,6 +103,9 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     createWorkflowEvent: mock(async () => {}),
     persistWorkflowEvent: mock(async () => {}),
     persistWorkflowEventIfRunning: mock(async () => ({ persisted: true })),
+    getMaxEventOrder: mock(async () => 0),
+    getGlobalMaxEventOrder: mock(async () => 0),
+    listWorkflowEventsAfter: mock(async () => []),
     findResumableRun: mock(async () => null),
     getDagResumeSnapshot: mock(async () => ({
       completedNodeOutputs: new Map<string, { output: string }>(),
@@ -118,7 +122,17 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
     pauseWorkflowRunForWait: mock(async () => {}),
-    clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
+    failPausedAttentionWait: mock(async () => ({ failed: true })),
+    clearWorkflowWaitContext: mock(
+      async (id: string, _wait: unknown, completion: { stepName: string }) => ({
+        cleared: true as const,
+        nodeEvent: {
+          workflow_run_id: id,
+          event_type: 'node_completed' as const,
+          step_name: completion.stepName,
+        },
+      })
+    ),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
     releaseWritebackClaim: mock(async () => {}),
@@ -158,13 +172,13 @@ function makeDeps(store?: IWorkflowStore): WorkflowDeps {
 }
 
 /** Minimal DAG workflow fixture — the preamble doesn't care about node details */
-function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
-  return {
+function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): ResolvedWorkflow {
+  return resolveWorkflow({
     name: 'test-workflow',
     description: 'Test',
     nodes: [{ id: 'test', kind: 'agent', source: { kind: 'command', name: 'test' } }],
     ...overrides,
-  };
+  });
 }
 
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {

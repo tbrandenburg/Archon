@@ -4,6 +4,8 @@
 import { appendFile, mkdir } from 'fs/promises';
 import { join, dirname } from 'path';
 import type { WorkflowTokenUsage } from './deps';
+import type { MessageChunk } from '@archon/providers/types';
+import type { SkipCause } from './schemas';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -34,6 +36,7 @@ export interface WorkflowEvent {
     | 'node_complete'
     | 'node_skipped'
     | 'node_error'
+    | 'watchdog_reset'
     | 'exec_output';
   workflow_id: string;
   workflow_name?: string;
@@ -46,7 +49,10 @@ export interface WorkflowEvent {
   cost_usd?: number;
   check?: string;
   result?: 'pass' | 'fail' | 'warn' | 'unknown';
+  cause?: SkipCause;
   error?: string;
+  /** `watchdog_reset` only. The chunk content is deliberately never retained. */
+  chunk_type?: MessageChunk['type'];
   /** `exec_output` only — see {@link logExecOutput}. Absent means the stream was empty. */
   stdout_tail?: string;
   /** `exec_output` only — see {@link logExecOutput}. Absent means the stream was empty. */
@@ -99,7 +105,8 @@ function getLogPath(logDir: string, workflowRunId: string): string {
 export async function logWorkflowEvent(
   logDir: string,
   workflowRunId: string,
-  event: Omit<WorkflowEvent, 'ts' | 'workflow_id'>
+  event: Omit<WorkflowEvent, 'ts' | 'workflow_id'>,
+  occurredAt = Date.now()
 ): Promise<void> {
   const logPath = getLogPath(logDir, workflowRunId);
 
@@ -110,7 +117,7 @@ export async function logWorkflowEvent(
     const fullEvent: WorkflowEvent = {
       ...event,
       workflow_id: workflowRunId,
-      ts: new Date().toISOString(),
+      ts: new Date(occurredAt).toISOString(),
     };
 
     await appendFile(logPath, JSON.stringify(fullEvent) + '\n');
@@ -125,6 +132,26 @@ export async function logWorkflowEvent(
     }
     // Don't throw - logging shouldn't break workflow execution
   }
+}
+
+/** Retain the privacy-safe evidence for one watchdog renewal. */
+export async function logWatchdogReset(
+  logDir: string,
+  workflowRunId: string,
+  nodeId: string,
+  chunkType: MessageChunk['type'],
+  resetAt: number
+): Promise<void> {
+  await logWorkflowEvent(
+    logDir,
+    workflowRunId,
+    {
+      type: 'watchdog_reset',
+      step: nodeId,
+      chunk_type: chunkType,
+    },
+    resetAt
+  );
 }
 
 /**
@@ -179,11 +206,13 @@ export async function logTool(
 export async function logWorkflowError(
   logDir: string,
   workflowRunId: string,
-  error: string
+  error: string,
+  usage?: WorkflowUsage
 ): Promise<void> {
   await logWorkflowEvent(logDir, workflowRunId, {
     type: 'workflow_error',
     error,
+    ...usage,
   });
 }
 
@@ -201,20 +230,6 @@ export async function logWorkflowComplete(
   });
 }
 
-/** Log DAG node start */
-export async function logNodeStart(
-  logDir: string,
-  workflowRunId: string,
-  nodeId: string,
-  commandName: string
-): Promise<void> {
-  await logWorkflowEvent(logDir, workflowRunId, {
-    type: 'node_start',
-    step: nodeId,
-    content: commandName,
-  });
-}
-
 /** Log DAG node completion */
 export async function logNodeComplete(
   logDir: string,
@@ -229,45 +244,6 @@ export async function logNodeComplete(
     step: nodeId,
     content: commandName,
     ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
-    // Spread whole: the caller already omitted every unreported axis, and a guard here
-    // would have to re-decide that per field — which is how `0` becomes absent.
-    ...usage,
-  });
-}
-
-/** Log DAG node skipped (when: false or trigger_rule not met) */
-export async function logNodeSkip(
-  logDir: string,
-  workflowRunId: string,
-  nodeId: string,
-  reason: string
-): Promise<void> {
-  await logWorkflowEvent(logDir, workflowRunId, {
-    type: 'node_skipped',
-    step: nodeId,
-    content: reason,
-  });
-}
-
-/**
- * Log DAG node error, with what the node spent before it failed.
- *
- * A node that fails mid-stream keeps the usage it already burned, so the failure row
- * carries spend for the same reason the completion row does (#2693). Callers whose
- * failure happens before any provider call — a missing command file, a substitution
- * error, a bash exit code — pass nothing, and the absent keys mean exactly that.
- */
-export async function logNodeError(
-  logDir: string,
-  workflowRunId: string,
-  nodeId: string,
-  error: string,
-  usage?: WorkflowUsage
-): Promise<void> {
-  await logWorkflowEvent(logDir, workflowRunId, {
-    type: 'node_error',
-    step: nodeId,
-    error,
     // Spread whole: the caller already omitted every unreported axis, and a guard here
     // would have to re-decide that per field — which is how `0` becomes absent.
     ...usage,

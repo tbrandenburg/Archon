@@ -10,8 +10,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  liveSourceRoots,
+  workflowSourceConfigForRoots,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 import { BUNDLED_COMMANDS, isBinaryBuild } from './defaults/bundled-defaults';
+import { bundledDefaultCommandPath, bundlesPackagedResources } from './defaults/bundle-inventory';
 import { createLogger } from '@archon/paths';
 import { isValidCommandName } from './command-validation';
 import type { LoadCommandResult } from './schemas';
@@ -391,6 +396,7 @@ export async function loadCommandPrompt(
   sourceRoots?: WorkflowSourceRoots
 ): Promise<LoadCommandResult> {
   const roots = sourceRoots ?? liveSourceRoots(cwd);
+  const sourceConfig = sourceRoots && workflowSourceConfigForRoots(sourceRoots);
   // Validate command name first
   if (!isValidCommandName(commandName)) {
     getLog().error({ commandName }, 'invalid_command_name');
@@ -404,7 +410,7 @@ export async function loadCommandPrompt(
   // Opt-out comes from the SOURCE when there is one — a capture carries the settings that
   // were in force when it was taken, so a resume cannot let the target's `defaults:`
   // decide whether the bundled scope counts. Falls back to reading `cwd` live.
-  let loadDefaultCommands = sourceRoots?.config.load_default_commands;
+  let loadDefaultCommands = sourceConfig?.load_default_commands;
   if (loadDefaultCommands === undefined) {
     try {
       loadDefaultCommands = (await deps.loadConfig(cwd)).defaults?.loadDefaultCommands ?? true;
@@ -425,7 +431,12 @@ export async function loadCommandPrompt(
   const packaged = parsePackagedResourceReference(commandName);
   if (packaged !== null) {
     if (packaged.owner.source === 'bundled') {
-      if (!loadDefaultCommands) {
+      if (
+        !loadDefaultCommands ||
+        (roots.kind === 'live' &&
+          !isBinaryBuild() &&
+          !(await bundlesPackagedResources(packaged.owner.pack)))
+      ) {
         return {
           success: false,
           reason: 'not_found',
@@ -515,7 +526,7 @@ export async function loadCommandPrompt(
   // target's, which is the right answer only for an in-place run — for a captured run it
   // would search folders the frozen source never used.
   const searchPaths = archonPaths.getCommandFolderSearchPaths(
-    sourceRoots?.config.command_folder ?? configuredFolder
+    sourceConfig?.command_folder ?? configuredFolder
   );
   const projectRoot = roots.project;
   const resolvedSearchPaths: string[] = [
@@ -524,7 +535,7 @@ export async function loadCommandPrompt(
   ];
 
   for (const dir of resolvedSearchPaths) {
-    const entries = await archonPaths.findMarkdownFilesRecursive(dir, '', { maxDepth: 1 });
+    const entries = await archonPaths.findCommandFiles(dir);
     const match = entries.find(e => e.commandName === commandName);
     if (!match) continue;
 
@@ -575,15 +586,19 @@ export async function loadCommandPrompt(
       }
       getLog().debug({ commandName }, 'command_bundled_not_found');
     } else {
-      // Bun (or any captured run): load from the bundled-commands root, walking 1 level
-      // deep so `defaults/archon-*.md` resolves.
+      // Live defaults are the flat files the index selects, so they resolve by direct
+      // path. Old captures retain whatever command layout they froze — subfolders
+      // included — so they keep the basename walk, independently of the current index.
       const appDefaultsPath = roots.bundledCommands;
-      const entries = await archonPaths.findMarkdownFilesRecursive(appDefaultsPath, '', {
-        maxDepth: 1,
-      });
-      const match = entries.find(e => e.commandName === commandName);
-      if (match) {
-        const filePath = join(appDefaultsPath, match.relativePath);
+      let filePath: string | null;
+      if (roots.kind === 'captured') {
+        const entries = await archonPaths.findCommandFiles(appDefaultsPath);
+        const match = entries.find(e => e.commandName === commandName);
+        filePath = match ? join(appDefaultsPath, match.relativePath) : null;
+      } else {
+        filePath = await bundledDefaultCommandPath(appDefaultsPath, commandName);
+      }
+      if (filePath !== null) {
         try {
           const content = await readFile(filePath, 'utf-8');
           if (!content.trim()) {
@@ -631,17 +646,16 @@ export async function loadCommandPrompt(
  * `executeWorkflow` re-enters with its own (absent) scope, correctly shadowing
  * the parent's adoption.
  */
-const adoptedRunDirContext = new AsyncLocalStorage<string>();
+const adoptedRunDirContext = new AsyncLocalStorage<string | undefined>();
 
 export function runWithAdoptedRunDir<T>(
   adoptedRunDir: string | undefined,
   fn: () => Promise<T>
 ): Promise<T> {
-  if (adoptedRunDir === undefined) return fn();
   return adoptedRunDirContext.run(adoptedRunDir, fn);
 }
 
-function currentAdoptedRunDir(): string | undefined {
+export function currentAdoptedRunDir(): string | undefined {
   return adoptedRunDirContext.getStore();
 }
 
@@ -850,13 +864,13 @@ function escapeRegExp(str: string): string {
  * Supports three formats, checked in order:
  * 1. <promise>SIGNAL</promise> - Recommended; prevents false positives in prose
  * 2. <anytag>SIGNAL</anytag> - Any XML-wrapped tag; case-insensitive on tag names
- * 3. Plain SIGNAL - Backwards compatibility; only at end of output or on own line
+ * 3. Plain SIGNAL - Backwards compatibility; only as the final standalone line
  *
  * Tag matching uses a backreference (\1) so opening and closing tag names must
  * agree — `<COMPLETE>X</done>` is not treated as a completion, which avoids
  * false positives when the AI interleaves tags in prose.
  *
- * Plain signal detection is restrictive to prevent false positives like "not SIGNAL yet".
+ * Plain signal detection requires the final line to contain only the signal.
  */
 export function detectCompletionSignal(output: string, signal: string): boolean {
   // Check for XML-like tag wrapping with matching open/close names: <tag>SIGNAL</tag>.
@@ -869,13 +883,14 @@ export function detectCompletionSignal(output: string, signal: string): boolean 
   if (xmlWrappedPattern.test(output)) {
     return true;
   }
-  // Plain signal detection - restrictive to prevent false positives like "not COMPLETE yet"
-  // Only matches if signal is:
-  // 1. At the very end of output (with optional trailing whitespace/punctuation)
-  // 2. On its own line
-  const endPattern = new RegExp(`${escapeRegExp(signal)}[\\s.,;:!?]*$`);
-  const ownLinePattern = new RegExp(`^\\s*${escapeRegExp(signal)}\\s*$`, 'm');
-  return endPattern.test(output) || ownLinePattern.test(output);
+  // The plain form counts only as the trimmed final line, and the final line is
+  // computed with string operations rather than a pattern: a matcher that has to
+  // enumerate its own tolerated line endings gets one of them wrong (a single
+  // trailing newline was tolerated where two broke the match). Trailing blank
+  // lines and whitespace are an artifact of streaming, never a signal.
+  const lines = output.trimEnd().split('\n');
+  const finalLine = (lines[lines.length - 1] ?? '').trim();
+  return finalLine === signal;
 }
 
 /**

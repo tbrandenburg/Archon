@@ -7,13 +7,13 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
-  buildTopologicalLayers,
   checkComposedBlockBoundaries,
   checkTriggerRule,
   resolveNodeBindings,
   substituteNodeOutputRefs,
   type ShellInputContext,
 } from './dag-executor';
+import { planGraph, resolvedBodyNodes } from './graph-plan';
 import { evaluateCondition } from './condition-evaluator';
 import {
   COMPILED_LOOP_COMMAND,
@@ -38,8 +38,13 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
-import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import {
+  assertWorkflowSourceIntegrity,
+  liveSourceRoots,
+  type WorkflowSourceRoots,
+} from './workflow-source';
 import { defaultRunInputs } from './workflow-inputs';
+import { buildExecNodeEnvironment } from './exec-environment';
 import {
   inputEnvKey,
   isGateNode,
@@ -51,9 +56,16 @@ import {
   isLoopNode,
   isWaitNode,
   isWorkflowNode,
+  waitCondition,
+  effortLevelSchema,
+  skipCauseSchema,
+  workflowRunOutcomeSchema,
   type DagNode,
   type NodeOutput,
-  type WorkflowDefinition,
+  type SkipCause,
+  type GraphPlan,
+  type ResolvedWorkflow,
+  type WorkflowRunOutcome,
 } from './schemas';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -210,6 +222,58 @@ function stubSatisfiesNode(node: DagNode, stub: DryRunStubValue): boolean {
   return true;
 }
 
+/**
+ * An authored stub stands in for a node's real output, so it owes the same contract.
+ *
+ * The generated-scaffold route already validates its placeholder against
+ * `output_format` (`generatedStubFor` throws on a schema it cannot satisfy); this is
+ * that check for a value a fixture wrote by hand, which otherwise reached
+ * `completedOutput` unexamined. Without it a fixture keeps passing while the schema it
+ * stands in for moves, and the suite's green stops meaning the real run would certify.
+ * Throwing here is what the surrounding catch turns into a failed node, so the fixture
+ * reports the schema errors rather than a downstream symptom.
+ *
+ * Called from `stubFor`, the single point an authored stub enters a simulation, so a
+ * new consumer cannot forget it. It sat at the two hydration sites first and one of
+ * them was missed — the loop one, which is the one that matters most: `loop:` is how
+ * a workflow declares an iterated verdict, so its schema is usually the contract a
+ * composition is built on.
+ */
+function assertAuthoredStubSatisfiesSchema(node: DagNode, stub: DryRunStubValue): void {
+  if (node.output_format === undefined) return;
+  // A string stub stands in for what the node PRINTS, which the engine parses before
+  // it validates; a non-string stub already is the structured value. Parse the first
+  // the way `certifyExecOutput` does, so a fixture may keep writing either form and
+  // both are held to the same contract.
+  let value: unknown = stub;
+  if (typeof stub === 'string') {
+    try {
+      value = JSON.parse(stub);
+    } catch {
+      throw new Error(
+        `Stub for node '${node.id}' declares output_format but is not one JSON document: ` +
+          stub.slice(0, 120)
+      );
+    }
+  }
+  let compileError: string | undefined;
+  const validation = validateStructuredOutput(value, node.output_format, message => {
+    compileError = message;
+  });
+  if (compileError !== undefined) {
+    throw new Error(
+      `Stub for node '${node.id}' cannot be checked: its output_format could not be ` +
+        `compiled (${compileError})`
+    );
+  }
+  if (!validation.valid) {
+    throw new Error(
+      `Stub for node '${node.id}' does not satisfy its output_format: ` +
+        validation.errors.join('; ')
+    );
+  }
+}
+
 function collectsStub(node: DagNode): boolean {
   // `include:` is no longer a DagNode member (#2486) — it never reaches this function.
   return !(
@@ -223,7 +287,7 @@ function collectsStub(node: DagNode): boolean {
 }
 
 /** Build the complete static stub map for an already-expanded workflow definition. */
-export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunStubs {
+export function createDryRunStubScaffold(workflow: ResolvedWorkflow): DryRunStubs {
   const stubs = new Map<string, { candidates: DryRunStubValue[]; consumers: DagNode[] }>();
   const visit = (nodes: readonly DagNode[]): void => {
     for (const node of nodes) {
@@ -237,14 +301,10 @@ export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunSt
           existing.consumers.push(node);
         }
       }
-      if (isLoopGroupNode(node)) visit(node.loop_group.nodes as DagNode[]);
+      if (isLoopGroupNode(node)) visit(resolvedBodyNodes(node.loop_group));
     }
   };
-  // "Already-expanded" per this function's own docblock — dry-run always simulates a
-  // fully-expanded WorkflowDefinition, so `workflow.nodes` never actually holds an
-  // `IncludeDirective` here even though the type admits one for the general
-  // pre-expansion case (#2486).
-  visit(workflow.nodes as DagNode[]);
+  visit(workflow.nodes);
   return Object.fromEntries(
     [...stubs].map(([id, entry]) => {
       const value = entry.candidates.find(candidate =>
@@ -262,7 +322,7 @@ export function createDryRunStubScaffold(workflow: WorkflowDefinition): DryRunSt
 
 /** Write a scaffold without ever overwriting an existing fixture. */
 export async function writeDryRunStubScaffold(
-  workflow: WorkflowDefinition,
+  workflow: ResolvedWorkflow,
   path: string
 ): Promise<DryRunStubs> {
   const stubs = createDryRunStubScaffold(workflow);
@@ -309,7 +369,7 @@ const dryRunNodeTypeSchema = z.enum([
 const dryRunResolutionSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
-  effort: z.string().optional(),
+  effort: effortLevelSchema.optional(),
   /** Where each value came from — 'node', 'model ref', 'workflow', 'assistant config', … */
   providerFrom: z.string(),
   modelFrom: z.string(),
@@ -349,6 +409,7 @@ export const dryRunTraceEntrySchema = z.discriminatedUnion('state', [
   dryRunTraceBaseSchema.extend({
     state: z.literal('skipped'),
     reason: z.string(),
+    cause: skipCauseSchema,
   }),
   dryRunTraceBaseSchema.extend({
     state: z.literal('failed'),
@@ -364,6 +425,7 @@ export type DryRunTraceEntry = z.infer<typeof dryRunTraceEntrySchema>;
 export const dryRunResultSchema = z.object({
   workflow: z.string(),
   outcome: z.enum(['completed', 'failed', 'paused', 'cancelled']),
+  authoredOutcome: workflowRunOutcomeSchema.nullable(),
   trace: z.array(dryRunTraceEntrySchema),
   missingStubs: z.array(z.string()),
   /**
@@ -448,7 +510,7 @@ function completedOutput(node: DagNode, stub: DryRunStubValue): NodeOutput {
 }
 
 interface DryRunContext {
-  workflow: WorkflowDefinition;
+  workflow: ResolvedWorkflow;
   userMessage: string;
   cwd: string;
   /**
@@ -473,13 +535,14 @@ interface DryRunContext {
    */
   inputs?: Record<string, JsonValue>;
   /**
-   * Per-simulation `$ARTIFACTS_DIR` / `$STATE_DIR`, under a uniquely named root in
+   * Per-simulation `$ARTIFACTS_DIR` / `$STATE_DIR` / `$LOG_DIR`, under a uniquely named root in
    * `<archonHome>/temp/` — NEVER inside the simulated repository, which holds source
    * only (#2619). Created lazily before the first `--exec-code` execution (#2617) and
    * removed when the simulation ends; a pure-stub dry run creates nothing.
    */
   artifactsDir: string;
   stateDir: string;
+  logDir: string;
   execCode: boolean;
   defaultStubs: boolean;
   pauseAtGates: boolean;
@@ -496,6 +559,7 @@ interface DryRunContext {
 }
 
 async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
+  await assertWorkflowSourceIntegrity(ctx.sourceRoots);
   const result = await loadCommandPrompt(
     {
       // Unreachable: `loadCommandPrompt` consults `loadConfig` only when its source roots
@@ -608,14 +672,16 @@ function recordSkipped(
   outputs: Map<string, NodeOutput>,
   ctx: DryRunContext,
   reason: string,
+  cause: SkipCause,
   iteration?: number
 ): void {
-  outputs.set(node.id, { state: 'skipped', output: '' });
+  outputs.set(node.id, { state: 'skipped', output: '', cause });
   ctx.trace.push({
     nodeId: node.id,
     nodeType: nodeType(node),
     state: 'skipped',
     reason,
+    cause,
     ...(iteration ? { iteration } : {}),
   });
 }
@@ -667,6 +733,7 @@ async function executeCodeNode(
         args = ['run', ...(node.deps ?? []).flatMap(dep => ['--with', dep]), 'python', '-c', code];
       }
     } else {
+      await assertWorkflowSourceIntegrity(ctx.sourceRoots);
       const script = (await discoverScriptsForCwd(ctx.cwd, ctx.sourceRoots)).get(code);
       if (!script) return { error: `Named script '${code}' was not found` };
       command = script.runtime === 'bun' ? 'bun' : 'uv';
@@ -702,13 +769,22 @@ async function executeCodeNode(
       timeout: node.timeout ?? 300_000,
       env: {
         ...process.env,
+        PYTHONDONTWRITEBYTECODE: '1',
         PWD: ctx.execWorkspace,
         OLDPWD: ctx.execWorkspace,
         ...inputEnv,
-        USER_MESSAGE: ctx.userMessage,
-        ARGUMENTS: ctx.userMessage,
-        ARTIFACTS_DIR: ctx.artifactsDir,
-        STATE_DIR: ctx.stateDir,
+        ...buildExecNodeEnvironment({
+          artifactsDir: ctx.artifactsDir,
+          stateDir: ctx.stateDir,
+          logDir: ctx.logDir,
+          workflowId: 'dry-run',
+          baseBranch: 'dry-run-base',
+          userMessage: ctx.userMessage,
+          loopUserInput: '',
+          loopPrevOutput: '',
+          rejectionReason: '',
+          issueContext: '',
+        }),
       },
     });
     return { output: result.stdout.replace(/\n$/, '') };
@@ -729,7 +805,11 @@ const TOLERATED_STUB_REASON =
 function stubFor(node: DagNode, ctx: DryRunContext): DryRunStubValue | undefined {
   if (Object.hasOwn(ctx.stubs, node.id)) {
     ctx.consumedStubs.add(node.id);
-    return ctx.stubs[node.id];
+    const authored = ctx.stubs[node.id];
+    // The one place an authored stub enters a simulation, so the one place that can
+    // hold its contract by construction rather than by each caller remembering to.
+    if (authored !== undefined) assertAuthoredStubSatisfiesSchema(node, authored);
+    return authored;
   }
   if (ctx.defaultStubs && !(isExecNode(node) && ctx.execCode)) {
     return generatedStubFor(node);
@@ -934,20 +1014,43 @@ async function simulateLoopGroup(
   iteration?: number
 ): Promise<void> {
   if (!isLoopGroupNode(node)) return;
-  // Already-expanded (see createDryRunStubScaffold's justification above) — never
-  // actually holds an `IncludeDirective` here.
-  const bodyNodes = node.loop_group.nodes as DagNode[];
+  const bodyNodes = resolvedBodyNodes(node.loop_group);
+  const bodyPlan = planGraph(bodyNodes);
+  // The executor builds the body's per-iteration context from the group's OWN resolved
+  // provider and model (dag-executor.ts), so the body must simulate against those rather
+  // than the enclosing workflow's scope. Everything the executor leaves alone — the
+  // workflow-level effort and options — stays as it is. Reporting fields that describe
+  // where the inherited model came from travel with it, or a body node would be
+  // attributed to a tier it did not resolve through.
+  const groupResolution = resolveNodeModel(node, ctx.scope, ctx.assistantModels, ctx.aiProfile);
+  const bodyScope: WorkflowModelScope = {
+    ...ctx.scope,
+    provider: groupResolution.provider,
+    model: groupResolution.model,
+    preset: groupResolution.preset,
+    tier: groupResolution.tier,
+    providerOrigin: groupResolution.providerOrigin,
+  };
+  // Swap the scope on the context the body is given rather than handing it a copy.
+  // `halted` is the one scalar a nested simulation writes back — a gate inside the body
+  // sets it — so a spread copy would swallow a pause and let the run continue past it.
+  // Restoring in `finally` keeps the group's own trace entry on the enclosing scope and
+  // nests correctly when a body contains another loop_group.
+  const outerScope = ctx.scope;
   let lastOutput = '';
   for (let current = 1; current <= node.loop_group.max_iterations; current++) {
     const bodyOutputs = new Map(outputs);
-    await simulateNodes(bodyNodes, bodyOutputs, ctx, current);
-    const bodyDependencies = new Set(node.loop_group.nodes.flatMap(body => body.depends_on ?? []));
+    ctx.scope = bodyScope;
+    try {
+      await simulateNodes(bodyPlan, bodyOutputs, ctx, current);
+    } finally {
+      ctx.scope = outerScope;
+    }
     lastOutput =
-      node.loop_group.nodes
-        .filter(body => !bodyDependencies.has(body.id))
-        .map(body => bodyOutputs.get(body.id))
+      bodyPlan.sinks
+        .map(bodyId => bodyOutputs.get(bodyId))
         .find(output => output?.state === 'completed' && output.output.trim())?.output ?? '';
-    const failed = node.loop_group.nodes.some(body => bodyOutputs.get(body.id)?.state === 'failed');
+    const failed = bodyNodes.some(body => bodyOutputs.get(body.id)?.state === 'failed');
     if (failed) {
       recordFailed(
         node,
@@ -991,12 +1094,14 @@ async function simulateNode(
   ctx: DryRunContext,
   iteration?: number
 ): Promise<void> {
-  if (checkComposedBlockBoundaries(node, outputs, ctx.inputs) === 'skip') {
-    recordSkipped(node, outputs, ctx, 'trigger_rule', iteration);
+  const boundaryDecision = checkComposedBlockBoundaries(node, outputs, ctx.inputs);
+  if (boundaryDecision.decision === 'skip') {
+    recordSkipped(node, outputs, ctx, 'trigger_rule', boundaryDecision.cause, iteration);
     return;
   }
-  if (checkTriggerRule(node, outputs) === 'skip') {
-    recordSkipped(node, outputs, ctx, 'trigger_rule', iteration);
+  const triggerDecision = checkTriggerRule(node, outputs);
+  if (triggerDecision.decision === 'skip') {
+    recordSkipped(node, outputs, ctx, 'trigger_rule', triggerDecision.cause, iteration);
     return;
   }
   if (node.when) {
@@ -1005,11 +1110,25 @@ async function simulateNode(
       // referencing `$INPUTS.<name>` branches on the same effective map a real run reads.
       const condition = evaluateCondition(node.when, outputs, ctx.inputs);
       if (!condition.parsed) {
-        recordSkipped(node, outputs, ctx, 'when_condition_parse_error', iteration);
+        recordSkipped(
+          node,
+          outputs,
+          ctx,
+          'when_condition_parse_error',
+          { kind: 'condition_parse_error', expr: node.when },
+          iteration
+        );
         return;
       }
       if (!condition.result) {
-        recordSkipped(node, outputs, ctx, 'when_condition_false', iteration);
+        recordSkipped(
+          node,
+          outputs,
+          ctx,
+          'when_condition_false',
+          { kind: 'condition', expr: node.when },
+          iteration
+        );
         return;
       }
     } catch (error) {
@@ -1028,12 +1147,16 @@ async function simulateNode(
       return;
     }
     if (isWaitNode(node)) {
+      const condition = waitCondition(node.wait);
+      const resolvedText =
+        condition.kind === 'attention' ? resolveText(condition.message, ctx, outputs) : undefined;
       outputs.set(node.id, { state: 'pending', output: '' });
       ctx.trace.push({
         nodeId: node.id,
         nodeType: 'wait',
         state: 'paused',
         reason: 'durable wait',
+        ...(resolvedText !== undefined ? { resolvedText } : {}),
         ...(iteration ? { iteration } : {}),
       });
       ctx.halted = 'paused';
@@ -1198,12 +1321,12 @@ async function simulateNode(
 }
 
 async function simulateNodes(
-  nodes: readonly DagNode[],
+  plan: GraphPlan,
   outputs: Map<string, NodeOutput>,
   ctx: DryRunContext,
   iteration?: number
 ): Promise<void> {
-  for (const layer of buildTopologicalLayers(nodes)) {
+  for (const layer of plan.layers) {
     for (const node of layer) {
       if (ctx.halted) return;
       await simulateNode(node, outputs, ctx, iteration);
@@ -1211,8 +1334,34 @@ async function simulateNodes(
   }
 }
 
+function resolveDryRunAuthoredOutcome(
+  workflow: ResolvedWorkflow,
+  outputs: ReadonlyMap<string, NodeOutput>,
+  consumedStubs: ReadonlySet<string>
+): WorkflowRunOutcome | null {
+  const field = workflow.outcome_field;
+  const returns = workflow.returns;
+  if (field === undefined || returns === undefined || !consumedStubs.has(returns)) return null;
+
+  const selectedOutput = outputs.get(returns);
+  if (selectedOutput?.state !== 'completed' || !('structuredOutput' in selectedOutput)) return null;
+
+  const structured = selectedOutput.structuredOutput;
+  const selectedNode = workflow.nodes.find(node => node.id === returns);
+  if (
+    selectedNode?.output_format === undefined ||
+    !validateStructuredOutput(structured, selectedNode.output_format).valid
+  ) {
+    return null;
+  }
+  if (!isRecord(structured) || !Object.hasOwn(structured, field)) return null;
+
+  const verdict = structured[field];
+  return typeof verdict === 'boolean' ? (verdict ? 'succeeded' : 'failed') : null;
+}
+
 export async function dryRunWorkflow(options: {
-  workflow: WorkflowDefinition;
+  workflow: ResolvedWorkflow;
   userMessage: string;
   cwd: string;
   stubs?: DryRunStubs;
@@ -1265,6 +1414,7 @@ export async function dryRunWorkflow(options: {
     ...(inputs ? { inputs } : {}),
     artifactsDir: join(tempRoot, 'artifacts'),
     stateDir: join(tempRoot, 'state'),
+    logDir: join(tempRoot, 'logs'),
     execCode: options.execCode ?? false,
     defaultStubs: options.defaultStubs ?? false,
     pauseAtGates: options.pauseAtGates ?? false,
@@ -1283,8 +1433,7 @@ export async function dryRunWorkflow(options: {
   };
   const outputs = new Map<string, NodeOutput>();
   try {
-    // Already-expanded (see createDryRunStubScaffold's justification above).
-    await simulateNodes(options.workflow.nodes as DagNode[], outputs, ctx);
+    await simulateNodes(options.workflow.plan, outputs, ctx);
   } finally {
     // Simulations are throwaway: whatever exec'd nodes wrote is discarded with the
     // per-run root (`force: true` makes the nothing-executed case a no-op). A cleanup
@@ -1297,10 +1446,8 @@ export async function dryRunWorkflow(options: {
     });
   }
 
-  const dependencies = new Set(options.workflow.nodes.flatMap(node => node.depends_on ?? []));
-  const summary = options.workflow.nodes
-    .filter(node => !dependencies.has(node.id))
-    .map(node => outputs.get(node.id))
+  const summary = options.workflow.plan.sinks
+    .map(nodeId => outputs.get(nodeId))
     .find(output => output?.state === 'completed' && output.output.trim())?.output;
   const anyFailed = [...outputs.values()].some(output => output.state === 'failed');
   const outcome =
@@ -1314,6 +1461,7 @@ export async function dryRunWorkflow(options: {
   return dryRunResultSchema.parse({
     workflow: options.workflow.name,
     outcome,
+    authoredOutcome: resolveDryRunAuthoredOutcome(options.workflow, outputs, ctx.consumedStubs),
     trace: ctx.trace,
     missingStubs: [...ctx.missingStubs].sort(),
     toleratedMissingStubs: [...ctx.toleratedMissingStubs].sort(),
@@ -1350,7 +1498,11 @@ export function formatDryRunTrace(result: DryRunResult): string {
     if (entry.resolvedText) lines.push(`  resolved: ${entry.resolvedText}`);
     if (entry.output !== undefined) lines.push(`  output: ${entry.output}`);
   }
-  lines.push('', `Outcome: ${result.outcome}`);
+  lines.push(
+    '',
+    `Simulation outcome: ${result.outcome}`,
+    `Authored outcome: ${result.authoredOutcome ?? 'undeclared'}`
+  );
   if (result.missingStubs.length > 0)
     lines.push(`Missing stubs: ${result.missingStubs.join(', ')}`);
   if (result.unusedStubs.length > 0) lines.push(`Unused stubs: ${result.unusedStubs.join(', ')}`);
