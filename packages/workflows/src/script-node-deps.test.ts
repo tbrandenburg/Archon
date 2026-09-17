@@ -132,6 +132,9 @@ function createMockStore(): IWorkflowStore {
     createWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEvent: mock(() => Promise.resolve()),
     persistWorkflowEventIfRunning: mock(() => Promise.resolve({ persisted: true })),
+    getMaxEventOrder: mock(() => Promise.resolve(0)),
+    getGlobalMaxEventOrder: mock(() => Promise.resolve(0)),
+    listWorkflowEventsAfter: mock(() => Promise.resolve([])),
     getDagResumeSnapshot: mock(() =>
       Promise.resolve({
         completedNodeOutputs: new Map<string, { output: string }>(),
